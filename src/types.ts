@@ -92,7 +92,7 @@ export type ScribeModel = {
       })
     | null;
   status: (typeof SCRIBE_STATUS)[number];
-  realtime_token: string | null;
+  transcript_only: boolean;
   prompt?: string;
   meta: {
     processings?: ScribeProcessing[];
@@ -107,7 +107,12 @@ export type ScribeModel = {
 
 export type ScribeProcessing = {
   created_date?: string;
-  provider?: string;
+  // Provider info — split into chat vs transcribe (may differ)
+  chat_provider?: "openai" | "azure" | "google";
+  transcribe_provider?: "openai" | "azure" | "google";
+  // Model names (bare model, no "provider/" prefix in meta)
+  chat_model?: string;
+  transcribe_model?: string;
   thinking?: string;
   transcription_time?: number;
   completion_output_tokens?: number;
@@ -123,13 +128,16 @@ export type ScribeProcessing = {
   completion_total_tokens?: number;
   completion_time?: number;
   completion_id?: string;
+  transcription_ids?: string[];
+  transcription_allotted_output_tokens?: number;
   prompt?: string;
   function?: Record<string, unknown>;
   processed_ai_response?: Awaited<ReturnType<typeof cleanAIResponse>>["meta"];
   ai_response?: ScribeModel["ai_response"];
   form_data?: ScribeModel["form_data"];
-  chat_model?: string;
-  audio_model?: string;
+  transcript_only?: boolean;
+  retries?: number;
+  cache_name?: string;
   error?: string;
 };
 
@@ -139,6 +147,7 @@ export type ScribeCreateRequest = {
   requested_in_facility_id?: string;
   requested_in_encounter_id?: string;
   transcript?: ScribeModel["transcript"];
+  transcript_only?: boolean;
   processed_ai_response?: ScribeProcessing["processed_ai_response"];
   benchmark?: boolean;
   chat_model?: string;
@@ -167,6 +176,7 @@ export enum ScribeFileType {
 
 export type ScribeMeta = {
   encounterId: string;
+  facilityId?: string;
   currentUser: UserBareMinimum;
   currentTime: string;
 };
@@ -239,6 +249,7 @@ export interface ScribeFileModel {
   upload_completed: boolean;
   read_signed_url: string;
   length: number;
+  mime_type: string;
 }
 
 export interface FacilityModel {
@@ -288,6 +299,7 @@ export interface FormQuestion {
   id: string;
   structured_type?: keyof typeof STRUCTURES;
   answer_option?: { value: string }[];
+  answer_value_set?: string;
   description?: string;
   text: string;
   required?: boolean;
@@ -298,6 +310,56 @@ export interface FormQuestion {
     system: string;
     display: string;
   };
+}
+
+// Subset of the care_fe ValueSet shape we rely on
+export interface ValueSetFilter {
+  op: string;
+  value: string;
+  property: string;
+}
+
+export interface ValueSetIncludeRule {
+  system: string;
+  filter?: ValueSetFilter[];
+  concept?: { code: string; display: string }[];
+}
+
+export interface ValueSetDefinition {
+  slug: string;
+  name?: string;
+  description?: string;
+  compose: {
+    include: ValueSetIncludeRule[];
+    exclude: ValueSetIncludeRule[];
+  };
+}
+
+export type KnownTerminology = "SNOMED" | "LOINC" | "UCUM";
+
+export const TERMINOLOGY_URI_TO_KNOWN: Record<string, KnownTerminology> = {
+  "http://snomed.info/sct": "SNOMED",
+  "http://loinc.org": "LOINC",
+  "http://unitsofmeasure.org": "UCUM",
+};
+
+/**
+ * Resolved metadata for a value-set slug, used to drive scribe prompt
+ * generation and post-processing of model responses.
+ *
+ * - `inlineConcepts`: full enumeration when the value set is small enough
+ *   to feed the model as a hard enum (Tier 1).
+ * - `knownSystem` + `filters`: present for Tier 2 prompts when all
+ *   include rules agree on a coding system we have prompt guidance for.
+ * - Falls through to Tier 3 (display-only fuzzy search) otherwise.
+ */
+export interface EnrichedValueSet {
+  slug: string;
+  definition: ValueSetDefinition | null;
+  inlineConcepts: Code[] | null;
+  knownSystem: KnownTerminology | null;
+  systemUri: string | null;
+  filters: ValueSetFilter[];
 }
 
 export const VALUESET_SYSTEM_NAMES = {
@@ -337,6 +399,8 @@ export type ScribeQuota = {
   tokens_per_user: number;
   used: number;
   allow_ocr: boolean;
+  allow_scribe: boolean;
+  allow_notes_scribe: boolean;
   tnc_hash: string | null;
   tnc_accepted_date: string | null;
 };
@@ -345,6 +409,8 @@ export type ScribeQuotaCreateRequest = {
   facility_external_id?: string;
   tokens: number;
   allow_ocr: boolean;
+  allow_scribe: boolean;
+  allow_notes_scribe: boolean;
   tokens_per_user: number;
 };
 

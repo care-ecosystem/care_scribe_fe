@@ -1,11 +1,11 @@
 import {
+  Code,
   ScribeAIResponse,
   ScribeDeseriliazedValue,
   ScribeHydratedAndRawField,
   ScribeMeta,
   ScribeModel,
   ScribeQuestionnaire,
-  VALUESET_SYSTEM_NAMES,
 } from "@/types";
 import { getHydratedFields } from "./field-utils";
 import STRUCTURES from "./structures";
@@ -13,6 +13,30 @@ import isEqual from "lodash.isequal";
 import { API } from "./api";
 import Fuse from "fuse.js";
 import dayjs from "dayjs";
+import { resolveValueSetResponse, UCUM_VALUESET_SLUG } from "./valueset-cache";
+
+// Recovers the display strings the model actually searched for from a
+// value-set tool response (Tier 1 raw display string or Tier 2/3
+// `{display_names: string[]}`). Used to surface useful
+// `"<term>" not found under <Field>` messages in the Review modal
+// instead of a raw value-set slug.
+const collectSearchedTerms = (raw: unknown): string[] => {
+  const collect = (item: unknown): string[] => {
+    if (typeof item === "string") return [item];
+    if (item && typeof item === "object") {
+      const dn = (item as { display_names?: unknown }).display_names;
+      if (Array.isArray(dn)) {
+        return dn.filter((d): d is string => typeof d === "string");
+      }
+    }
+    return [];
+  };
+  const items = Array.isArray(raw) ? raw : [raw];
+  return Array.from(new Set(items.flatMap(collect))).filter(Boolean);
+};
+
+const formatSearchedDisplay = (terms: string[]) =>
+  terms.length ? `"${terms.join('", "')}"` : "Value";
 
 export const cleanAIResponse = async (
   aiResponse: ScribeAIResponse,
@@ -76,7 +100,122 @@ export const cleanAIResponse = async (
           processAiResponse.failed[k] = deserialized.errors || [];
         }
 
-        if (field.question.answer_option?.length) {
+        // Quantity fields: care_fe wires the unit picker to the UCUM
+        // value set, and when the question has `answer_value_set` the
+        // "Type" picker is bound to that set. Both unit and coding go
+        // through the same tiered pipeline as value-set choice fields:
+        // the AI returns a display string or `{display_names}`, we
+        // resolve to a canonical `Code` via the value-set expansion
+        // endpoint. Unresolvable entries are dropped (value alone is
+        // still useful and the user can re-pick from the UI). Done
+        // before the `isEqual` check below so an unchanged AI
+        // suggestion isn't flagged as new.
+        if (
+          field.question.type === "quantity" &&
+          deserializedValue !== null &&
+          deserializedValue !== undefined
+        ) {
+          const SLOT_LABEL: Record<"unit" | "coding", string> = {
+            unit: "unit",
+            coding: "type",
+          };
+          const resolveSlot = async (
+            q: any,
+            key: "unit" | "coding",
+            slug: string,
+          ) => {
+            if (!q || typeof q !== "object" || q[key] == null) return q;
+            const raw = q[key];
+            const resolved = await resolveValueSetResponse(
+              slug,
+              raw,
+              false,
+              searchByDisplay,
+            );
+            if (
+              !resolved ||
+              (Array.isArray(resolved) && resolved.length === 0)
+            ) {
+              const searched = formatSearchedDisplay(collectSearchedTerms(raw));
+              processAiResponse.failed[k] = [
+                ...(processAiResponse.failed[k] || []),
+                `${searched} not found under ${field.friendlyName} (${SLOT_LABEL[key]})`,
+              ];
+              // eslint-disable-next-line @typescript-eslint/no-unused-vars
+              const { [key]: _dropped, ...rest } = q;
+              return rest;
+            }
+            return { ...q, [key]: resolved };
+          };
+          const resolveOne = async (q: any) => {
+            let next = await resolveSlot(q, "unit", UCUM_VALUESET_SLUG);
+            if (field.question.answer_value_set) {
+              next = await resolveSlot(
+                next,
+                "coding",
+                field.question.answer_value_set,
+              );
+            }
+            return next;
+          };
+          deserializedValue = (
+            Array.isArray(deserializedValue)
+              ? await Promise.all(deserializedValue.map(resolveOne))
+              : await resolveOne(deserializedValue)
+          ) as ScribeDeseriliazedValue;
+          processAiResponse.successful[k] = {
+            value: deserializedValue,
+            note,
+          };
+        }
+
+        // Value-set choice fields: resolve the model output (which may be
+        // a display string for Tier 1, `{code,display_names}` for Tier 2,
+        // or `{display_names}` for Tier 3) into a canonical Code via the
+        // value-set expansion endpoint. See `valueset-cache.ts`.
+        if (
+          field.question.type === "choice" &&
+          field.question.answer_value_set &&
+          !field.question.structured_type &&
+          deserializedValue !== null &&
+          deserializedValue !== undefined
+        ) {
+          const resolved = await resolveValueSetResponse(
+            field.question.answer_value_set,
+            deserializedValue,
+            !!field.question.repeats,
+            searchByDisplay,
+          );
+          if (
+            resolved === null ||
+            (Array.isArray(resolved) && resolved.length === 0)
+          ) {
+            // Surface what the model actually searched for so the
+            // clinician sees a useful "<term> not found under <Field>"
+            // message instead of a raw value-set slug.
+            const searchedDisplay = formatSearchedDisplay(
+              collectSearchedTerms(deserializedValue),
+            );
+            processAiResponse.failed[k] = [
+              ...(processAiResponse.failed[k] || []),
+              `${searchedDisplay} not found under ${field.friendlyName}`,
+            ];
+            return null;
+          }
+          deserializedValue = resolved as unknown as ScribeDeseriliazedValue;
+          processAiResponse.successful[k] = {
+            value: deserializedValue,
+            note,
+          };
+        }
+
+        // `answer_option` enum validation only applies to string-ish
+        // fields. Quantity values are numbers with a unit/coding and
+        // would never match a string option, so skip the check entirely.
+        if (
+          field.question.type !== "quantity" &&
+          field.question.answer_option?.length
+        ) {
           // If the field has answer options, check if the deserialized value is in the options
           const arrdeserializedValue = !Array.isArray(deserializedValue)
             ? [deserializedValue]
@@ -247,12 +386,11 @@ export async function poller(
 export async function lookupCode(
   code: string,
   display: string[],
-  type: keyof typeof VALUESET_SYSTEM_NAMES,
+  type: string,
 ) {
   try {
-    // verify that the code is a valid SNOMED code. i.e. it is a nummber
-    if (!/^\d+$/.test(code)) {
-      throw Error(`Invalid SNOMED code: ${code}`);
+    if (!code) {
+      throw Error(`Empty code passed to lookupCode for ${type}`);
     }
 
     const results = (await API.valuesets.expand(type, code)).results;
@@ -307,29 +445,47 @@ export async function lookupCode(
     );
   } catch (error) {
     console.warn(error);
-    for (const d of display) {
-      const fallbackQuery = (await API.valuesets.expand(type, d)).results;
-      if (
-        fallbackQuery &&
-        fallbackQuery.length &&
-        fallbackQuery[0].display?.toLowerCase() === d.toLowerCase()
-      ) {
-        console.log(
-          "Using fallback query for code lookup: ",
-          d,
-          "of type: ",
-          type,
-          "with code: ",
-          fallbackQuery[0].code,
-        );
+    return searchByDisplay(type, display);
+  }
+}
+
+/**
+ * Resolve a value-set entry purely from its candidate display strings by
+ * searching the value-set expansion endpoint and fuzzy-matching the top
+ * results. Used as the primary path for Tier 3 (unknown system) value
+ * sets and as a fallback for Tier 2 when the model-provided code can't
+ * be verified.
+ */
+export async function searchByDisplay(
+  slug: string,
+  displays: string[],
+): Promise<Code | null> {
+  for (const d of displays) {
+    if (!d) continue;
+    try {
+      const { results } = await API.valuesets.expand(slug, d);
+      if (!results || !results.length) continue;
+      const fuse = new Fuse(results, {
+        keys: ["display"],
+        ignoreLocation: true,
+        includeScore: true,
+        threshold: 0.4,
+      });
+      const hits = fuse.search(d);
+      const best = hits[0]?.item ?? results[0];
+      if (best) {
         return {
-          system: fallbackQuery[0].system,
-          code: fallbackQuery[0].code,
-          display: fallbackQuery[0].display,
+          system: best.system,
+          code: best.code,
+          display: best.display,
         };
       }
+    } catch (err) {
+      console.warn(
+        `searchByDisplay failed for slug "${slug}" / display "${d}"`,
+        err,
+      );
     }
-
-    return null;
   }
+  return null;
 }

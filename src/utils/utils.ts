@@ -10,6 +10,40 @@ export const renderCamelCase = (str: string) => {
   return str.replace(/_/g, " ");
 };
 
+// Detects the `Code` shape produced for value-set choice fields:
+// `{ system: string, code: string, display?: string }`. Used by
+// renderFieldValue so the Review modal and history don't fall through to
+// `JSON.stringify` and render "[object Object]".
+const isCodeLike = (
+  v: unknown,
+): v is { system: string; code: string; display?: string } =>
+  !!v &&
+  typeof v === "object" &&
+  typeof (v as { system?: unknown }).system === "string" &&
+  typeof (v as { code?: unknown }).code === "string";
+
+const renderCode = (v: { code: string; display?: string }) =>
+  v.display ?? v.code;
+
+// Detects the quantity shape produced for quantity fields:
+// `{ value: number, unit?: { code, display? }, coding?: { code, display? } }`.
+type QuantityLike = {
+  value: number;
+  unit?: { code: string; display?: string };
+  coding?: { code: string; display?: string };
+};
+const isQuantityLike = (v: unknown): v is QuantityLike =>
+  !!v &&
+  typeof v === "object" &&
+  typeof (v as { value?: unknown }).value === "number";
+
+const renderQuantity = (v: QuantityLike) => {
+  const unit = v.unit?.display ?? v.unit?.code ?? "";
+  const amount = unit ? `${v.value} ${unit}` : `${v.value}`;
+  const type = v.coding?.display ?? v.coding?.code;
+  return type ? `${type}: ${amount}` : amount;
+};
+
 export const renderFieldValue = (
   values: {
     value: ScribeDeseriliazedValue;
@@ -23,14 +57,30 @@ export const renderFieldValue = (
   let humanValue: ReactNode = "";
   if (values.structure) {
     humanValue = values.structure.toPrompt(val as any);
+  } else if (isCodeLike(val)) {
+    humanValue = renderCode(val);
+  } else if (Array.isArray(val) && val.length && val.every(isCodeLike)) {
+    humanValue = (val as unknown as Array<{ code: string; display?: string }>)
+      .map(renderCode)
+      .join(", ");
+  } else if (isQuantityLike(val)) {
+    humanValue = renderQuantity(val);
+  } else if (Array.isArray(val) && val.length && val.every(isQuantityLike)) {
+    humanValue = (val as unknown as QuantityLike[])
+      .map(renderQuantity)
+      .join(", ");
   } else {
     // convert from snake case to human readable text
     humanValue =
-      (typeof val === "string"
-        ? renderCamelCase(val)
-        : Array.isArray(val)
-          ? val.map((val) => renderCamelCase(String(val))).join(", ")
-          : JSON.stringify(val)
+      (typeof val === "boolean"
+        ? val
+          ? "yes"
+          : "no"
+        : typeof val === "string"
+          ? renderCamelCase(val)
+          : Array.isArray(val)
+            ? val.map((val) => renderCamelCase(String(val))).join(", ")
+            : JSON.stringify(val)
       )?.toLocaleLowerCase() || "";
   }
 
@@ -75,6 +125,7 @@ export const calculateCost = (
     console.warn(`Model ${model} not found in AI_MODELS`);
     return 0;
   }
+
   const { input, output, cached } = modelData.cost;
   let audio_input: number = input;
   let audio_cached: number = cached;
